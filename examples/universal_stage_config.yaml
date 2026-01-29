@@ -1,0 +1,26 @@
+# Stage configuration for testing the UniversalStage
+# This defines a single stage with two operators: VisionOperator and AudioOperator.
+
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: universal
+    runtime:
+      devices: "0" # Local device for testing
+      max_batch_size: 1
+      num_workers: 2
+    engine_args:
+      operators:
+        - name: my_vision_operator
+          class: vllm_omni.universal.operators.vision.VisionOperator
+          config: 
+            param1: "value1"
+        - name: my_audio_operator
+          class: vllm_omni.universal.operators.audio.AudioOperator
+          config:
+            param2: "value2"
+    final_output: true
+    final_output_type: multimodal
+    default_sampling_params:
+      temperature: 1.0
+      max_tokens: 1

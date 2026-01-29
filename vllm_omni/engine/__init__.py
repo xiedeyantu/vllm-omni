@@ -75,6 +75,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
 class OmniEngineCoreOutput(EngineCoreOutput):
     pooling_output: dict[str, torch.Tensor] | None = None
+    multimodal_outputs: dict[str, Any] = {}
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
