@@ -94,7 +94,13 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return YuanrongConnector(config)
 
 
+def _create_zmq_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    from .connectors.zmq_connector import ZmqConnector
+    return ZmqConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
+OmniConnectorFactory.register_connector("ZmqConnector", _create_zmq_connector)

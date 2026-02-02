@@ -23,6 +23,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from .config import OmniModelConfig
 from .entrypoints.async_omni import AsyncOmni
+from .outputs import OmniRequestOutput, UniversalStageRequest, UniversalStageOutput
 
 # Main entry points
 from .entrypoints.omni import Omni
@@ -38,6 +39,10 @@ __all__ = [
     "AsyncOmni",
     # Configuration
     "OmniModelConfig",
+    # Output types
+    "OmniRequestOutput",
+    "UniversalStageRequest",
+    "UniversalStageOutput",
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
 ]

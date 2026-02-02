@@ -20,6 +20,11 @@ def _looks_like_bagel(model_name: str) -> bool:
         cfg = get_hf_file_to_dict("config.json", model_name)
     except Exception:
         return False
+    
+    # Handle case where cfg is None
+    if cfg is None:
+        return False
+    
     model_type = cfg.get("model_type")
     if model_type == "bagel":
         return True

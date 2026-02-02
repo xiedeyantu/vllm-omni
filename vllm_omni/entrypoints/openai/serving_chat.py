@@ -1858,105 +1858,132 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if not prompt:
                 return self._create_error_response("No text prompt found in messages")
 
-            # Extract generation parameters from extra_body (preferred)
-            # Reference: text_to_image.py and text_to_video.py for supported parameters
-            extra_body = getattr(request, "extra_body", None) or {}
-
-            # Parse size if provided (supports "1024x1024" format)
-            height = extra_body.get("height")
-            width = extra_body.get("width")
-            if "size" in extra_body:
+            # Check if multimodal data is embedded in prompt
+            multimodal_data: dict[str, Any] = {}
+            if prompt.startswith("__MULTIMODAL_DATA__:"):
+                import json
                 try:
-                    size_str = extra_body["size"]
-                    if isinstance(size_str, str) and "x" in size_str.lower():
-                        w, h = size_str.lower().split("x")
-                        width, height = int(w), int(h)
-                except ValueError:
-                    logger.warning("Invalid size format: %s", extra_body.get("size"))
-
-            # Get request parameters from extra_body
-            # Text-to-image parameters (ref: text_to_image.py)
-            num_inference_steps = extra_body.get("num_inference_steps", 50)
-            guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
-            seed = extra_body.get("seed")
-            negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
-
-            # Text-to-video parameters (ref: text_to_video.py)
-            num_frames = extra_body.get("num_frames")
-            guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
-            lora_body = extra_body.get("lora")
-
-            logger.info(
-                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
-                request_id,
-                prompt[:50] + "..." if len(prompt) > 50 else prompt,
-                len(reference_images),
-                {k: v for k, v in extra_body.items() if v is not None},
-            )
-
-            # Decode reference images if provided
-            pil_images: list[Image.Image] = []
-            for img_b64 in reference_images:
-                try:
-                    img_bytes = base64.b64decode(img_b64)
-                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                    # Parse embedded multimodal data
+                    end_idx = prompt.find(":__END__")
+                    if end_idx > 0:
+                        json_str = prompt[len("__MULTIMODAL_DATA__:"):end_idx]
+                        multimodal_data = json.loads(json_str)
+                        # Remove the embedded marker from prompt
+                        prompt = prompt[end_idx + len(":__END__\n"):].strip()
+                        if not prompt and "text" in multimodal_data:
+                            prompt = multimodal_data.pop("text", "")
+                        logger.debug(f"Parsed multimodal data: {list(multimodal_data.keys())}")
                 except Exception as e:
-                    logger.warning("Failed to decode reference image: %s", e)
+                    logger.warning(f"Failed to parse embedded multimodal data: {e}")
 
-            # Build generation kwargs
-            gen_prompt: OmniTextPrompt = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-            }
-            gen_params = OmniDiffusionSamplingParams(
-                num_inference_steps=num_inference_steps,
-                height=height,
-                width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
-                seed=seed,
-            )
+            # If we have multimodal data (video_paths, audio_paths, etc.), it's for universal stage
+            if multimodal_data:
+                # Pass multimodal data directly to engine
+                gen_prompt = multimodal_data
+                gen_params = OmniDiffusionSamplingParams()  # Minimal params for universal stage
+                pil_images = []  # No PIL images for universal stage
+                logger.info(f"Universal stage request {request_id}: multimodal_data keys={list(multimodal_data.keys())}")
+            else:
+                # Traditional diffusion path
+                # Extract generation parameters from extra_body (preferred)
+                # Reference: text_to_image.py and text_to_video.py for supported parameters
+                extra_body = getattr(request, "extra_body", None) or {}
 
-            if guidance_scale is not None:
-                gen_params.guidance_scale = guidance_scale
+                # Parse size if provided (supports "1024x1024" format)
+                height = extra_body.get("height")
+                width = extra_body.get("width")
+                if "size" in extra_body:
+                    try:
+                        size_str = extra_body["size"]
+                        if isinstance(size_str, str) and "x" in size_str.lower():
+                            w, h = size_str.lower().split("x")
+                            width, height = int(w), int(h)
+                    except ValueError:
+                        logger.warning("Invalid size format: %s", extra_body.get("size"))
 
-            # Add Qwen-Image specific parameter
-            if true_cfg_scale is not None:
-                gen_params.true_cfg_scale = true_cfg_scale
+                # Get request parameters from extra_body
+                # Text-to-image parameters (ref: text_to_image.py)
+                num_inference_steps = extra_body.get("num_inference_steps", 50)
+                guidance_scale = extra_body.get("guidance_scale")
+                true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
+                seed = extra_body.get("seed")
+                negative_prompt = extra_body.get("negative_prompt")
+                num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
-            # Add video generation parameters if set
-            if num_frames is not None:
-                gen_params.num_frames = num_frames
-            if guidance_scale_2 is not None:
-                gen_params.guidance_scale_2 = guidance_scale_2
+                # Text-to-video parameters (ref: text_to_video.py)
+                num_frames = extra_body.get("num_frames")
+                guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+                lora_body = extra_body.get("lora")
 
-            # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
-            if lora_body and isinstance(lora_body, dict):
-                try:
-                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-                    lora_path = (
-                        lora_body.get("local_path")
-                        or lora_body.get("path")
-                        or lora_body.get("lora_path")
-                        or lora_body.get("lora_local_path")
-                    )
-                    # using "or" directly here may be buggy if `scale=0`
-                    lora_scale = lora_body.get("scale")
-                    if lora_scale is None:
-                        lora_scale = lora_body.get("lora_scale")
-                    lora_int_id = lora_body.get("int_id")
-                    if lora_int_id is None:
-                        lora_int_id = lora_body.get("lora_int_id")
-                    if lora_int_id is None and lora_path:
-                        lora_int_id = stable_lora_int_id(str(lora_path))
-                    if lora_name and lora_path:
-                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = float(lora_scale)
-                except Exception as e:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", e)
+                logger.info(
+                    "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
+                    request_id,
+                    prompt[:50] + "..." if len(prompt) > 50 else prompt,
+                    len(reference_images),
+                    {k: v for k, v in extra_body.items() if v is not None},
+                )
+
+                # Decode reference images if provided
+                pil_images: list[Image.Image] = []
+                for img_b64 in reference_images:
+                    try:
+                        img_bytes = base64.b64decode(img_b64)
+                        pil_images.append(Image.open(BytesIO(img_bytes)))
+                    except Exception as e:
+                        logger.warning("Failed to decode reference image: %s", e)
+
+                # Build generation kwargs
+                gen_prompt: OmniTextPrompt = {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                }
+                gen_params = OmniDiffusionSamplingParams(
+                    num_inference_steps=num_inference_steps,
+                    height=height,
+                    width=width,
+                    num_outputs_per_prompt=num_outputs_per_prompt,
+                    seed=seed,
+                )
+
+                if guidance_scale is not None:
+                    gen_params.guidance_scale = guidance_scale
+
+                # Add Qwen-Image specific parameter
+                if true_cfg_scale is not None:
+                    gen_params.true_cfg_scale = true_cfg_scale
+
+                # Add video generation parameters if set
+                if num_frames is not None:
+                    gen_params.num_frames = num_frames
+                if guidance_scale_2 is not None:
+                    gen_params.guidance_scale_2 = guidance_scale_2
+
+                # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
+                if lora_body and isinstance(lora_body, dict):
+                    try:
+                        lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+                        lora_path = (
+                            lora_body.get("local_path")
+                            or lora_body.get("path")
+                            or lora_body.get("lora_path")
+                            or lora_body.get("lora_local_path")
+                        )
+                        # using "or" directly here may be buggy if `scale=0`
+                        lora_scale = lora_body.get("scale")
+                        if lora_scale is None:
+                            lora_scale = lora_body.get("lora_scale")
+                        lora_int_id = lora_body.get("int_id")
+                        if lora_int_id is None:
+                            lora_int_id = lora_body.get("lora_int_id")
+                        if lora_int_id is None and lora_path:
+                            lora_int_id = stable_lora_int_id(str(lora_path))
+                        if lora_name and lora_path:
+                            lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                            gen_params.lora_request = lora_req
+                            if lora_scale is not None:
+                                gen_params.lora_scale = float(lora_scale)
+                    except Exception as e:  # pragma: no cover - safeguard
+                        logger.warning("Failed to parse LoRA request: %s", e)
 
             # Add reference image if provided
             if pil_images:
@@ -2002,6 +2029,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params=gen_params,
                     request_id=request_id,
                 )
+            
+            # Debug: log result structure
+            logger.debug(f"Result type: {type(result)}, Result attributes: {dir(result) if result else 'None'}")
+            logger.debug(f"Result: {result}")
+            
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
@@ -2023,10 +2055,48 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
 
             # Build response
-            if not image_contents:
-                content = "Image generation completed but no images were produced."
-            else:
+            # Check for universal stage operator outputs
+            # For AsyncOmni, results are in result.request_output.multimodal_output
+            multimodal_output = None
+            if hasattr(result, "request_output") and result.request_output:
+                multimodal_output = getattr(result.request_output, "multimodal_output", None)
+            
+            if multimodal_output and isinstance(multimodal_output, dict):
+                import json
+                
+                # Check for universal stage structure (operator_outputs and metrics)
+                operator_outputs = multimodal_output.get("operator_outputs", {})
+                
+                if operator_outputs:
+                    # Best case: we have explicitly separated operator outputs per req
+                    # The engine already grouped them by operator name for this specific request
+                    operator_results = {
+                        "type": "universal_stage_results",
+                        "operators": operator_outputs
+                    }
+                    content = json.dumps(operator_results, indent=2, ensure_ascii=False)
+                    logger.info("Universal stage outputs (structured): %s", list(operator_outputs.keys()))
+                elif "metrics" in multimodal_output and "multimodal_outputs" in multimodal_output.get("metrics", {}):
+                    # Fallback: metrics with aggregated outputs
+                    multimodal_data = multimodal_output["metrics"]["multimodal_outputs"]
+                    operator_results = {
+                        "type": "universal_stage_results",
+                        "data": multimodal_data
+                    }
+                    content = json.dumps(operator_results, indent=2, ensure_ascii=False)
+                    logger.info("Universal stage outputs (fallback metrics): %s", list(multimodal_data.keys()))
+                else:
+                    # Last resort: just dump the multimodal output
+                    operator_results = {
+                        "type": "universal_stage_results",
+                        "data": multimodal_output
+                    }
+                    content = json.dumps(operator_results, indent=2, ensure_ascii=False)
+                    logger.info("Universal stage outputs (direct dump): %s", list(multimodal_output.keys()))
+            elif image_contents:
                 content = image_contents
+            else:
+                content = "Image generation completed but no images were produced."
 
             # Use model_construct to bypass validation for multimodal content
             # (ChatMessage.content only accepts str, but we need list for images)
@@ -2080,6 +2150,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         messages: list[dict[str, Any]],
     ) -> tuple[str, list[str]]:
         """Extract text prompt and base64 images from chat messages.
+        Also extracts multimodal data (video_paths, audio_paths) for universal stages.
 
         Args:
             messages: List of chat messages
@@ -2089,6 +2160,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         prompt_parts: list[str] = []
         images: list[str] = []
+        multimodal_data: dict[str, Any] = {}
 
         for message in messages:
             role = message.get("role", "")
@@ -2108,14 +2180,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(item, str):
                         prompt_parts.append(item)
                     elif isinstance(item, dict):
+                        item_type = item.get("type")
+                        
                         # Handle {"type": "text", "text": "..."} format
-                        if item.get("type") == "text":
+                        if item_type == "text":
                             prompt_parts.append(item.get("text", ""))
                         # Handle {"text": "..."} format
                         elif "text" in item and "type" not in item:
                             prompt_parts.append(item["text"])
                         # Handle {"type": "image_url", "image_url": {"url": "..."}}
-                        elif item.get("type") == "image_url":
+                        elif item_type == "image_url":
                             url = item.get("image_url", {}).get("url", "")
                             if url.startswith("data:image"):
                                 try:
@@ -2126,8 +2200,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # Handle {"image": "base64..."} format
                         elif "image" in item:
                             images.append(item["image"])
+                        
+                        # Handle universal stage multimodal data
+                        # {"type": "video_paths", "video_paths": [...]}
+                        elif item_type == "video_paths":
+                            video_paths = item.get("video_paths", [])
+                            if video_paths:
+                                multimodal_data["video_paths"] = video_paths
+                                logger.debug(f"Extracted {len(video_paths)} video_paths from messages")
+                        
+                        # {"type": "audio_paths", "audio_paths": [...]}
+                        elif item_type == "audio_paths":
+                            audio_paths = item.get("audio_paths", [])
+                            if audio_paths:
+                                multimodal_data["audio_paths"] = audio_paths
+                                logger.debug(f"Extracted {len(audio_paths)} audio_paths from messages")
+                        
+                        # {"type": "image_paths", "image_paths": [...]}
+                        elif item_type == "image_paths":
+                            image_paths = item.get("image_paths", [])
+                            if image_paths:
+                                multimodal_data["image_paths"] = image_paths
+                                logger.debug(f"Extracted {len(image_paths)} image_paths from messages")
 
         prompt = " ".join(prompt_parts).strip()
+        
+        # Store multimodal data in a thread-local or request context if available
+        # For now, we'll embed it in the prompt string using a special marker
+        if multimodal_data:
+            # Create a special encoded format that can be parsed later
+            import json
+            multimodal_json = json.dumps(multimodal_data)
+            # Prepend multimodal data as a special marker
+            prompt = f"__MULTIMODAL_DATA__:{multimodal_json}:__END__\n{prompt}" if prompt else f"__MULTIMODAL_DATA__:{multimodal_json}:__END__"
+            logger.debug(f"Embedded multimodal data in prompt: {list(multimodal_data.keys())}")
+        
         return prompt, images
 
     def _create_error_response(

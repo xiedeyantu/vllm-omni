@@ -41,6 +41,8 @@ from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 from vllm_omni.entrypoints.log_utils import count_tokens_from_outputs
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_llm import OmniLLM
+from vllm_omni.universal.async_universal_stage import AsyncUniversalStage
+from vllm_omni.universal.universal_stage import UniversalStage, UniversalStageConfig
 from vllm_omni.entrypoints.stage_utils import (
     SHUTDOWN_TASK,
     OmniStageTaskType,
@@ -107,14 +109,14 @@ class OmniStage:
         self.is_tracing_enabled = False
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
-        self.model_stage = stage_config.engine_args.model_stage
+        self.model_stage = getattr(stage_config.engine_args, "model_stage", None)
         self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
         self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
-        # Support for different stage types: "llm" (default) or "diffusion"
-        self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+        # Support for different stage types: "llm" (default), "diffusion", or "universal"
+        self.stage_type: Literal["llm", "diffusion", "universal"] = getattr(stage_config, "stage_type", "llm")
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -131,9 +133,13 @@ class OmniStage:
         default_sampling_params = _to_dict(default_sampling_params)
         # Further convert it to dataclass to check fields
         try:
-            self.default_sampling_params = (
-                SamplingParams if self.stage_type == "llm" else OmniDiffusionSamplingParams
-            )(**default_sampling_params)
+            if self.stage_type == "llm":
+                self.default_sampling_params = SamplingParams(**default_sampling_params)
+            elif self.stage_type == "diffusion":
+                self.default_sampling_params = OmniDiffusionSamplingParams(**default_sampling_params)
+            else:
+                # For universal or other stages, we keep it as a dict or any provided default
+                self.default_sampling_params = default_sampling_params
         except TypeError as error:
             raise TypeError(f"Invalid default_sampling_params for stage {self.stage_id}: {error}") from error
         # Runtime orchestration state (added)
@@ -520,9 +526,9 @@ def _stage_worker(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
-    stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
+    stage_type: Literal["llm", "diffusion", "universal"] = stage_payload.get("stage_type", "llm")
 
-    if stage_type != "diffusion":
+    if stage_type not in ["diffusion", "universal"]:
         _resolve_worker_cls(engine_args)
 
     # Aggregates for running average
@@ -696,6 +702,15 @@ def _stage_worker(
                 engine_input_source=stage_payload.get("engine_input_source", []),
                 **engine_args,
             )
+        elif stage_type == "universal":
+            config = UniversalStageConfig(
+                stage_id=stage_id,
+                worker_id=_os.getpid(),
+                engine_input_source=stage_payload.get("engine_input_source", []),
+                operators=engine_args.get("operators", []),
+                runtime=runtime_cfg,
+            )
+            stage_engine = UniversalStage(config=config)
         else:
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
@@ -904,6 +919,14 @@ def _stage_worker(
                     if not hasattr(result, "request_id") or result.request_id is None:
                         if idx < len(batch_request_ids):
                             result.request_id = batch_request_ids[idx]
+            elif stage_type == "universal":
+                stage_engine = cast(UniversalStage, stage_engine)
+                # Universal stage generates results for the batch
+                gen_outputs.extend(stage_engine.generate(
+                    batch_engine_inputs,
+                    sampling_params=batch_engine_sampling_params,
+                    request_ids=batch_request_ids
+                ))
             else:
                 stage_engine = cast(OmniLLM, stage_engine)
                 batch_engine_sampling_params = cast(SamplingParams, batch_engine_sampling_params)
@@ -1243,6 +1266,17 @@ async def _stage_worker_async(
                 **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
+        elif stage_type == "universal":
+            config = UniversalStageConfig(
+                stage_id=stage_id,
+                worker_id=_os.getpid(),
+                engine_input_source=stage_payload.get("engine_input_source", []),
+                operators=engine_args.get("operators", []),
+                runtime=runtime_cfg,
+            )
+            stage_engine = AsyncUniversalStage(config=config)
+            # Universal stage doesn't have vllm config
+            vllm_config = None
         else:
             omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
             usage_context = UsageContext.OPENAI_API_SERVER
@@ -1390,12 +1424,22 @@ async def _stage_worker_async(
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
                 gen_output = None
-                async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
+                gen_candidate = cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid)
+        
+                if asyncio.iscoroutine(gen_candidate):
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
+                else:
+                    # Async generator: iterate as before
+                    async for res in gen_candidate:
+                        gen_output = res
+                        _gen_t1 = _time.time()
+                        _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                        _gen_t0 = _gen_t1
+                        await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
             out_q.put(

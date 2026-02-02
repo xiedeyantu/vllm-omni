@@ -5,6 +5,9 @@ CLI entry point for vLLM-Omni that intercepts vLLM commands.
 import importlib.metadata
 import sys
 
+# Apply patches before vLLM is imported
+from vllm_omni import patch  # noqa: F401
+
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""

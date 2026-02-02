@@ -74,7 +74,22 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
 
 class OmniEngineCoreOutput(EngineCoreOutput):
+    """Engine core output for omni models with multimodal support.
+    
+    Attributes:
+        pooling_output: Optional dictionary of pooling outputs (tensors)
+        multimodal_outputs: Dictionary of multimodal outputs from operators
+        us_output: Dictionary storing outputs from universal stage operators
+            Keys are operator class names (e.g., "VideoLaplacianPipeline")
+            Values are operator-specific output dicts containing:
+                - "result": The computed result(s)
+                - "status": Per-item processing status ("success" / "error")
+                - "passed": Per-item pass/fail status
+                - Other operator-specific fields
+    """
     pooling_output: dict[str, torch.Tensor] | None = None
+    multimodal_outputs: dict[str, Any] = {}
+    us_output: dict[str, Any] = {}  # Universal stage operator outputs
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

@@ -1,0 +1,32 @@
+# Stage configuration for testing the UniversalStage
+# This defines a single stage with two video processing operators:
+# - VideoAspectRatioPipeline: Filters videos by aspect ratio
+# - VideoLaplacianPipeline: Filters videos by sharpness (Laplacian variance)
+
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: universal
+    runtime:
+      devices: "0" # Local device for testing
+      max_batch_size: 1
+    engine_args:
+      operators:
+        - name: video_aspect_ratio_filter
+          class: vllm_omni.universal.operators.video_aspect_ratio.VideoAspectRatioPipeline
+          config:
+            min_ratio: "9/21"
+            max_ratio: "21/9"
+            any_or_all: "any"
+        - name: video_laplacian_filter
+          class: vllm_omni.universal.operators.video_laplacian.VideoLaplacianPipeline
+          config:
+            stride: 8
+            min_score: 100.0
+            max_score: 5000.0
+            any_or_all: "any"
+    final_output: true
+    final_output_type: multimodal
+    default_sampling_params:
+      temperature: 1.0
+      max_tokens: 1

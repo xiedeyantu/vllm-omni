@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 from PIL import Image
@@ -7,6 +7,9 @@ from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+
+if TYPE_CHECKING:
+    from vllm_omni.engine import OmniEngineCoreOutput
 
 
 class OmniModelRunnerOutput(ModelRunnerOutput):
@@ -233,3 +236,237 @@ class OmniRequestOutput:
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
+
+
+@dataclass
+class UniversalStageRequest:
+    """Request for universal stage operators.
+    
+    This class represents a standardized request that flows through 
+    the universal stage pipeline. It can originate from:
+    1. API requests (chat completion requests)
+    2. Previous stage outputs (chained processing)
+    
+    The request data can be a dictionary (typical) or other structured formats
+    that operators understand.
+    
+    Attributes:
+        request_id: Unique identifier for this request
+        stage_id: Identifier of the current/target stage
+        data: The actual request data (typically dict with "video_paths", etc.)
+        metadata: Optional metadata about the request
+        source_stage_id: Which stage this request came from (for chaining)
+        pass_through_fields: Additional fields to preserve through pipeline
+    """
+    
+    request_id: str
+    stage_id: int
+    data: dict[str, Any]  # Main payload - operators expect this format
+    metadata: dict[str, Any] = field(default_factory=dict)
+    source_stage_id: int | None = None  # For stage chaining
+    pass_through_fields: dict[str, Any] = field(default_factory=dict)
+    
+    @classmethod
+    def from_api_request(
+        cls,
+        request_id: str,
+        stage_id: int,
+        data: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> "UniversalStageRequest":
+        """Create request from API call.
+        
+        Args:
+            request_id: Request identifier
+            stage_id: Target stage ID
+            data: Request data (dict with operator-specific fields)
+            metadata: Optional metadata
+            
+        Returns:
+            UniversalStageRequest configured for API mode
+        """
+        return cls(
+            request_id=request_id,
+            stage_id=stage_id,
+            data=data,
+            metadata=metadata or {},
+            source_stage_id=None,
+        )
+    
+    @classmethod
+    def from_previous_stage(
+        cls,
+        request_id: str,
+        source_stage_id: int,
+        target_stage_id: int,
+        data: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        pass_through: dict[str, Any] | None = None,
+    ) -> "UniversalStageRequest":
+        """Create request from previous stage output (stage chaining).
+        
+        Args:
+            request_id: Request identifier (preserved from previous stage)
+            source_stage_id: ID of previous stage
+            target_stage_id: ID of current/target stage
+            data: Processed data from previous stage
+            metadata: Optional metadata
+            pass_through: Fields to preserve through pipeline
+            
+        Returns:
+            UniversalStageRequest configured for stage chaining
+        """
+        return cls(
+            request_id=request_id,
+            stage_id=target_stage_id,
+            data=data,
+            metadata=metadata or {},
+            source_stage_id=source_stage_id,
+            pass_through_fields=pass_through or {},
+        )
+    
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "request_id": self.request_id,
+            "stage_id": self.stage_id,
+            "data": self.data,
+            "metadata": self.metadata,
+            "source_stage_id": self.source_stage_id,
+        }
+
+
+@dataclass
+class UniversalStageOutput:
+    """Unified output from universal stage operators.
+    
+    This class wraps the output from UniversalEngine and represents
+    the processed result. It bridges between OmniEngineCoreOutput and
+    OmniRequestOutput, providing:
+    1. Operator-specific outputs (stored by operator name)
+    2. Processing metadata and status
+    3. Easy conversion to OmniRequestOutput for API responses
+    4. Support for stage chaining to next stage
+    
+    Attributes:
+        request_id: Request identifier
+        stage_id: Stage that produced this output
+        operator_outputs: Dict mapping operator class name to its output dict
+            Each operator output typically contains:
+            - "result": The main computation result
+            - "status": "success" or "error"
+            - "passed": Per-item pass/fail status
+            - Other operator-specific fields
+        metrics: Processing metrics (timing, throughput, etc.)
+        errors: Any errors that occurred during processing
+        finished: Whether processing completed successfully
+        execution_time_ms: Total execution time in milliseconds
+    """
+    
+    request_id: str
+    stage_id: int
+    operator_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    finished: bool = True
+    execution_time_ms: float = 0.0
+    
+    @classmethod
+    def from_engine_output(
+        cls,
+        request_id: str,
+        stage_id: int,
+        engine_output: "OmniEngineCoreOutput",
+        execution_time_ms: float = 0.0,
+    ) -> "UniversalStageOutput":
+        """Create output from UniversalEngine output.
+        
+        Args:
+            request_id: Request identifier
+            stage_id: Stage ID
+            engine_output: Output from UniversalEngine.execute()
+            execution_time_ms: Execution time in milliseconds
+            
+        Returns:
+            UniversalStageOutput with all engine outputs captured
+        """
+        # Extract operator outputs from us_output dict
+        operator_outputs = getattr(engine_output, "us_output", {})
+        
+        # Extract metrics if available
+        metrics = {}
+        if hasattr(engine_output, "multimodal_outputs"):
+            metrics["multimodal_outputs"] = engine_output.multimodal_outputs
+        if hasattr(engine_output, "pooling_output") and engine_output.pooling_output:
+            metrics["pooling_output"] = engine_output.pooling_output
+        
+        return cls(
+            request_id=request_id,
+            stage_id=stage_id,
+            operator_outputs=operator_outputs,
+            metrics=metrics,
+            finished=True,
+            execution_time_ms=execution_time_ms,
+        )
+    
+    def add_error(self, error_msg: str) -> None:
+        """Add error message."""
+        self.errors.append(error_msg)
+        self.finished = False
+    
+    def to_omni_request_output(self) -> OmniRequestOutput:
+        """Convert to OmniRequestOutput for API response.
+        
+        This bridges UniversalStageOutput to the standard OmniRequestOutput
+        format that the serving layer expects.
+        
+        Returns:
+            OmniRequestOutput with universal stage data packed into fields
+        """
+        ro = OmniRequestOutput(
+            request_id=self.request_id,
+            stage_id=self.stage_id,
+            finished=self.finished,
+            final_output_type="universal",  # Mark as universal stage output
+        )
+        
+        # Pack operator outputs and metrics into multimodal_output
+        ro.multimodal_output = {
+            "operator_outputs": self.operator_outputs,
+            "metrics": self.metrics,
+            "errors": self.errors,
+            "execution_time_ms": self.execution_time_ms,
+        }
+        
+        # Add metrics to the metrics field for compatibility
+        ro.metrics = {
+            "execution_time_ms": self.execution_time_ms,
+            "operators_count": len(self.operator_outputs),
+            "has_errors": len(self.errors) > 0,
+        }
+        
+        return ro
+    
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "request_id": self.request_id,
+            "stage_id": self.stage_id,
+            "operator_outputs": self.operator_outputs,
+            "metrics": self.metrics,
+            "errors": self.errors,
+            "finished": self.finished,
+            "execution_time_ms": self.execution_time_ms,
+        }
+    
+    def __repr__(self) -> str:
+        """Custom repr."""
+        return (
+            f"UniversalStageOutput("
+            f"request_id={self.request_id!r}, "
+            f"stage_id={self.stage_id}, "
+            f"operators={len(self.operator_outputs)}, "
+            f"finished={self.finished}, "
+            f"time={self.execution_time_ms:.2f}ms"
+            f")"
+        )

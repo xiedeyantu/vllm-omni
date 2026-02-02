@@ -1,4 +1,5 @@
 import sys
+import os
 
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
@@ -14,6 +15,30 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
+
+# Patch DeviceConfig to handle environments where no platform is detected
+def _patch_device_config():
+    """Patch vLLM's DeviceConfig to fallback to CPU when no platform is detected."""
+    from vllm.config.device import DeviceConfig
+    
+    _original_post_init = DeviceConfig.__post_init__
+    
+    def _new_post_init(self):
+        """Modified __post_init__ with fallback to CPU."""
+        try:
+            _original_post_init(self)
+        except RuntimeError as e:
+            if "Failed to infer device type" in str(e):
+                # Fallback to CPU if device inference fails
+                import torch
+                self.device_type = "cpu"
+                self.device = torch.device("cpu")
+            else:
+                raise
+    
+    DeviceConfig.__post_init__ = _new_post_init
+
+_patch_device_config()
 
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others

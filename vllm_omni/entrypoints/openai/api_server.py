@@ -343,6 +343,9 @@ async def omni_init_app_state(
             if stage_type == "diffusion":
                 is_pure_diffusion = True
                 logger.info("Detected pure diffusion mode (single diffusion stage)")
+    
+    # Also treat universal processing modes as non-LLM if vllm_config is None
+    is_non_llm_mode = is_pure_diffusion or (vllm_config is None)
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -362,8 +365,8 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
 
-    # Pure Diffusion mode: use simplified initialization logic
-    if is_pure_diffusion:
+    # Non-LLM mode (diffusion or universal stages): use simplified initialization logic
+    if is_non_llm_mode:
         model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
@@ -377,7 +380,7 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
-        logger.info("Pure diffusion API server initialized for model: %s", model_name)
+        logger.info("Non-LLM API server initialized for model: %s (mode: %s)", model_name, "universal stages" if not is_pure_diffusion else "diffusion")
         return
 
     # LLM or multi-stage mode: use standard initialization logic
@@ -470,12 +473,16 @@ async def omni_init_app_state(
         else:
             logger.warning("Cannot initialize processors: vllm_config is None. OpenAIServingModels may fail.")
 
-    state.openai_serving_models = OpenAIServingModels(
-        engine_client=engine_client,
-        base_model_paths=base_model_paths,
-        lora_modules=lora_modules,
-    )
-    await state.openai_serving_models.init_static_loras()
+    # Only initialize OpenAIServingModels if vllm_config is available
+    if vllm_config is not None:
+        state.openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,
+            base_model_paths=base_model_paths,
+            lora_modules=lora_modules,
+        )
+        await state.openai_serving_models.init_static_loras()
+    else:
+        logger.info("Skipping OpenAIServingModels initialization for pure diffusion/universal stage mode")
 
     state.openai_serving_responses = (
         OpenAIServingResponses(
@@ -518,7 +525,7 @@ async def omni_init_app_state(
             enable_log_deltas=args.enable_log_deltas,
             log_error_stack=args.log_error_stack,
         )
-        if "generate" in supported_tasks
+        if ("generate" in supported_tasks or vllm_config is None)
         else None
     )
     # Warm up chat template processing to avoid first-request latency
@@ -535,7 +542,7 @@ async def omni_init_app_state(
             enable_force_include_usage=args.enable_force_include_usage,
             log_error_stack=args.log_error_stack,
         )
-        if "generate" in supported_tasks
+        if ("generate" in supported_tasks or vllm_config is None)
         else None
     )
     state.openai_serving_pooling = (
