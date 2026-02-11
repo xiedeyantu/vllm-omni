@@ -10,6 +10,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.universal.data import OmniUniversalConfig
 
 logger = init_logger(__name__)
 
@@ -270,3 +271,19 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
+
+
+##########################################################################
+# For OmniUniversal
+##########################################################################
+
+def register_dummy_run_for_omni_universal(ou_config: OmniUniversalConfig):
+    func_name = "dummy_run"
+    return _load_process_func(ou_config, func_name)
+
+def _load_process_func2(ou_config: OmniUniversalConfig, func_name: str):
+    """Load and return a process function from the appropriate module."""
+    module_name = f"vllm_omni.universal.operators.dummy.{func_name}"
+    module = importlib.import_module(module_name)
+    func = getattr(module, func_name)
+    return func(ou_config)

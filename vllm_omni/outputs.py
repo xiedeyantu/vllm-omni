@@ -233,3 +233,42 @@ class OmniRequestOutput:
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
+    
+
+
+
+    ##########################################################################
+    # For OmniUniversal
+    ##########################################################################
+
+    @classmethod
+    def from_universal(
+        cls,
+        request_id: str,
+        prompt: OmniPromptType | None = None,
+        metrics: dict[str, Any] | None = None,
+        latents: torch.Tensor | None = None,
+        multimodal_output: dict[str, Any] | None = None,
+        final_output_type: str = "image",
+    ) -> "OmniRequestOutput":
+        """Create output from universal model.
+
+        Args:
+            request_id: Request identifier
+            images: Generated images
+            prompt: The prompt used
+            metrics: Generation metrics
+            latents: Optional latent tensors
+
+        Returns:
+            OmniRequestOutput configured for diffusion mode
+        """
+        return cls(
+            request_id=request_id,
+            final_output_type=final_output_type,
+            prompt=prompt,
+            latents=latents,
+            metrics=metrics or {},
+            multimodal_output=multimodal_output or {},
+            finished=True,
+        )
